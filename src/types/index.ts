@@ -8,11 +8,14 @@ export interface AnalysisStep {
   levelAfter: string
 }
 
+export type AddressSource = 'token_core_real' | 'demo_fallback' | 'unavailable'
+
 export interface AddressRiskSample {
   address: string
   label: string
   riskType: string
   severity: 'high' | 'medium' | 'low'
+  aiAdvice: string
   evidenceSources: string[]
   analysisScript: AnalysisStep[]
 }
@@ -30,6 +33,7 @@ export interface ContractRiskSample {
   name: string
   maliciousType: string
   severity: 'high' | 'medium' | 'low'
+  aiAdvice: string
   codeHints: string[]
   evidenceSources: string[]
   maliciousAction: MaliciousActionConfig
@@ -45,6 +49,7 @@ export interface InteractionAuditRecord {
   drainEth: number
   drainUsdc: number
   signatureDigest: string
+  addressSource: AddressSource
   status: '已执行' | '已取消'
 }
 
@@ -55,4 +60,5 @@ export interface BalanceChange {
   detail: string
   after: number
   time: string
+  addressSource: AddressSource
 }

@@ -5,11 +5,15 @@ import { Input } from '@repo/ui/components/input'
 import { Select } from '@repo/ui/components/select'
 import { addressRiskSamples, contractRiskSamples } from '@/data/samples'
 import { walletCoreService } from '@/services/walletCoreService'
-import type { AnalysisStep, BalanceChange, InteractionAuditRecord } from '@/types'
+import type { AddressSource, AnalysisStep, BalanceChange, InteractionAuditRecord } from '@/types'
 
 type TabKey = 'wallet' | 'contract' | 'test'
 
 type TokenKey = 'ETH' | 'USDC'
+
+type ActionContext =
+  | { mode: 'transfer'; token: TokenKey; amount: number; label: string; targetAddress: string; riskType: string; aiAdvice: string }
+  | { mode: 'contract'; name: string; contractAddress: string; riskType: string; approvalText: string; drainEth: number; drainUsdc: number; aiAdvice: string }
 
 interface AnalysisLog extends AnalysisStep {
   time: string
@@ -46,7 +50,7 @@ export default function App() {
   const [balances, setBalances] = useState<{ ETH: number; USDC: number }>({ ETH: 0, USDC: 0 })
   const [isTotalHidden, setIsTotalHidden] = useState(false)
   const [balanceChanges, setBalanceChanges] = useState<BalanceChange[]>([])
-  const [records, setRecords] = useState<string[]>(['系统初始化：钱包已创建，等待领取测试资产。'])
+  const [records, setRecords] = useState<string[]>(['系统初始化：检测到未创建钱包，已进入创建钱包引导。'])
   const [audits, setAudits] = useState<InteractionAuditRecord[]>([])
 
   const [selectedAddressIndex, setSelectedAddressIndex] = useState(0)
@@ -56,11 +60,8 @@ export default function App() {
   const [selectedContractIndex, setSelectedContractIndex] = useState(0)
 
   const [analysis, setAnalysis] = useState<AnalysisState>(initialAnalysis)
-  const [analysisContext, setAnalysisContext] = useState<
-    | { mode: 'transfer'; token: TokenKey; amount: number; label: string; riskType: string }
-    | { mode: 'contract'; name: string; riskType: string; approvalText: string; drainEth: number; drainUsdc: number }
-    | null
-  >(null)
+  const [analysisContext, setAnalysisContext] = useState<ActionContext | null>(null)
+  const [pendingExecution, setPendingExecution] = useState<ActionContext | null>(null)
 
   const analysisTokenRef = useRef(0)
 
@@ -68,16 +69,28 @@ export default function App() {
   const [coreMode, setCoreMode] = useState('初始化中')
   const [walletId, setWalletId] = useState('')
   const [mnemonicMasked, setMnemonicMasked] = useState('')
-  const [derivedAddress, setDerivedAddress] = useState('')
+  const [ethAddress, setEthAddress] = useState('')
+  const [addressSource, setAddressSource] = useState<AddressSource>('unavailable')
+  const [showFullAddress, setShowFullAddress] = useState(false)
   const [signInput, setSignInput] = useState('demo message')
   const [signature, setSignature] = useState('')
   const [walletPassword, setWalletPassword] = useState('12345678')
   const [coreStatus, setCoreStatus] = useState('等待初始化')
+  const [creatingWallet, setCreatingWallet] = useState(false)
+  const [signingAction, setSigningAction] = useState(false)
 
   const [setEthInput, setSetEthInput] = useState('0.0000')
   const [setUsdcInput, setSetUsdcInput] = useState('0.00')
 
   const [balanceModalToken, setBalanceModalToken] = useState<TokenKey | null>(null)
+  const [signNotice, setSignNotice] = useState<{
+    title: string
+    summary: string
+    advice: string
+    signatureDigest: string
+    riskScore: number
+    lossText: string
+  } | null>(null)
 
   const totalBalance = useMemo(() => balances.ETH * basePrice.ETH + balances.USDC * basePrice.USDC, [balances])
 
@@ -114,7 +127,14 @@ export default function App() {
     setRecords((prev) => [...prev, `${nowText()} | ${text}`])
   }
 
-  function addBalanceChange(token: TokenKey, delta: number, action: string, detail: string, nextValue: number) {
+  function addBalanceChange(
+    token: TokenKey,
+    delta: number,
+    action: string,
+    detail: string,
+    nextValue: number,
+    source: AddressSource = addressSource
+  ) {
     setBalanceChanges((prev) => [
       ...prev,
       {
@@ -123,7 +143,8 @@ export default function App() {
         action,
         detail,
         after: nextValue,
-        time: nowText()
+        time: nowText(),
+        addressSource: source
       }
     ])
   }
@@ -131,8 +152,8 @@ export default function App() {
   function claimAssets() {
     const next = { ETH: balances.ETH + 1.25, USDC: balances.USDC + 1800 }
     setBalances(next)
-    addBalanceChange('ETH', 1.25, '领取测试资产', '领取按钮', next.ETH)
-    addBalanceChange('USDC', 1800, '领取测试资产', '领取按钮', next.USDC)
+    addBalanceChange('ETH', 1.25, '领取测试资产', '领取按钮', next.ETH, 'unavailable')
+    addBalanceChange('USDC', 1800, '领取测试资产', '领取按钮', next.USDC, 'unavailable')
     addRecord('领取测试资产成功：+1.25 ETH，+1800 USDC（模拟）')
   }
 
@@ -202,6 +223,10 @@ export default function App() {
     return summarizeSignature(sig)
   }
 
+  function closeSignNotice() {
+    setSignNotice(null)
+  }
+
   async function startTransferFlow() {
     const amount = Number(amountInput)
     if (Number.isNaN(amount) || amount <= 0) {
@@ -215,19 +240,19 @@ export default function App() {
     }
 
     try {
-      const sigDigest = await preSign(`transfer:${selectedAddress.address}:${selectedToken}:${amount}`)
       setAnalysisContext({
         mode: 'transfer',
         token: selectedToken,
         amount,
         label: selectedAddress.label,
-        riskType: selectedAddress.riskType
+        targetAddress: selectedAddress.address,
+        riskType: selectedAddress.riskType,
+        aiAdvice: selectedAddress.aiAdvice
       })
-
-      const done = await runAnalysis('地址转账前 AI 风险分析', selectedAddress.evidenceSources, selectedAddress.analysisScript)
+      const done = await runAnalysis('签名转账操作（Token Core）风险分析', selectedAddress.evidenceSources, selectedAddress.analysisScript)
       if (!done) return
 
-      addRecord(`签名前置校验完成：摘要=${sigDigest}`)
+      addRecord(`本次地址来源：${getAddressSourceLabel(addressSource)}`)
     } catch (error) {
       alert(getErrorMessage(error))
     }
@@ -238,21 +263,21 @@ export default function App() {
       const action = selectedContract.maliciousAction
       const drainEth = Math.min(balances.ETH, action.drain.eth)
       const drainUsdc = Math.min(balances.USDC, action.drain.usdc)
-      const sigDigest = await preSign(`contract:${selectedContract.contract}:${action.approvalText}`)
 
       setAnalysisContext({
         mode: 'contract',
         name: selectedContract.name,
+        contractAddress: selectedContract.contract,
         riskType: selectedContract.maliciousType,
         approvalText: action.approvalText,
         drainEth,
-        drainUsdc
+        drainUsdc,
+        aiAdvice: selectedContract.aiAdvice
       })
-
-      const done = await runAnalysis('合约交互前 AI 风险分析', selectedContract.evidenceSources, selectedContract.analysisScript)
+      const done = await runAnalysis('签名合约操作（Token Core）风险分析', selectedContract.evidenceSources, selectedContract.analysisScript)
       if (!done) return
 
-      addRecord(`签名前置校验完成：摘要=${sigDigest}`)
+      addRecord(`本次地址来源：${getAddressSourceLabel(addressSource)}`)
     } catch (error) {
       alert(getErrorMessage(error))
     }
@@ -264,73 +289,157 @@ export default function App() {
     setAnalysisContext(null)
   }
 
-  function confirmAction() {
+  async function confirmAction() {
     if (!analysis.done || !analysisContext) {
       return
     }
+    setSigningAction(true)
+    try {
+      const signPayload =
+        analysisContext.mode === 'transfer'
+          ? `transfer:${analysisContext.targetAddress}:${analysisContext.token}:${analysisContext.amount}`
+          : `contract:${analysisContext.contractAddress}:${analysisContext.approvalText}`
+      const sigDigest = await preSign(signPayload)
+      addRecord(
+        analysisContext.mode === 'transfer'
+          ? `Token Core 签名完成：签名转账操作，摘要=${sigDigest}`
+          : `Token Core 签名完成：签名合约操作，摘要=${sigDigest}`
+      )
 
-    if (analysisContext.mode === 'transfer') {
+      const summary =
+        analysisContext.mode === 'transfer'
+          ? `你已经交互恶意转账地址：${analysisContext.label}（${analysisContext.riskType}）`
+          : `你已经交互恶意合约：${analysisContext.name}（${analysisContext.riskType}）`
+
+      setPendingExecution(analysisContext)
+      setSignNotice({
+        title: '经明御钱包实时监控发现',
+        summary,
+        advice: analysisContext.aiAdvice,
+        signatureDigest: sigDigest,
+        riskScore: analysis.score,
+        lossText: formatLossForNotice(analysisContext)
+      })
+      closeAnalysis()
+    } catch (error) {
+      alert(getErrorMessage(error))
+    } finally {
+      setSigningAction(false)
+    }
+  }
+
+  function executePendingAction() {
+    if (!pendingExecution) {
+      closeSignNotice()
+      return
+    }
+
+    if (pendingExecution.mode === 'transfer') {
       const nextBalance = {
         ...balances,
-        [analysisContext.token]: balances[analysisContext.token] - analysisContext.amount
+        [pendingExecution.token]: balances[pendingExecution.token] - pendingExecution.amount
       }
       setBalances(nextBalance)
       addBalanceChange(
-        analysisContext.token,
-        -analysisContext.amount,
+        pendingExecution.token,
+        -pendingExecution.amount,
         '模拟转账',
-        `风险类型=${analysisContext.riskType}`,
-        nextBalance[analysisContext.token]
+        `风险类型=${pendingExecution.riskType}`,
+        nextBalance[pendingExecution.token]
       )
       addRecord(
-        `模拟转账已执行：${analysisContext.label}，转出 ${analysisContext.amount} ${analysisContext.token}，风险分=${analysis.score}`
+        `模拟转账已执行：${pendingExecution.label}，转出 ${pendingExecution.amount} ${pendingExecution.token}，风险分=${signNotice?.riskScore ?? analysis.score}`
       )
       setAudits((prev) => [
         ...prev,
         {
           time: nowText(),
           kind: '恶意地址转账',
-          target: analysisContext.label,
-          riskType: analysisContext.riskType,
+          target: pendingExecution.label,
+          riskType: pendingExecution.riskType,
           approvalText: '签名通过',
-          drainEth: analysisContext.token === 'ETH' ? analysisContext.amount : 0,
-          drainUsdc: analysisContext.token === 'USDC' ? analysisContext.amount : 0,
+          drainEth: pendingExecution.token === 'ETH' ? pendingExecution.amount : 0,
+          drainUsdc: pendingExecution.token === 'USDC' ? pendingExecution.amount : 0,
           signatureDigest: summarizeSignature(signature),
+          addressSource,
           status: '已执行'
         }
       ])
     } else {
       const nextBalance = {
-        ETH: balances.ETH - analysisContext.drainEth,
-        USDC: balances.USDC - analysisContext.drainUsdc
+        ETH: balances.ETH - pendingExecution.drainEth,
+        USDC: balances.USDC - pendingExecution.drainUsdc
       }
       setBalances(nextBalance)
-      if (analysisContext.drainEth > 0) {
-        addBalanceChange('ETH', -analysisContext.drainEth, '恶意 DApp 交互扣减', `${analysisContext.approvalText} 后触发扣减`, nextBalance.ETH)
+      if (pendingExecution.drainEth > 0) {
+        addBalanceChange('ETH', -pendingExecution.drainEth, '恶意 DApp 交互扣减', `${pendingExecution.approvalText} 后触发扣减`, nextBalance.ETH)
       }
-      if (analysisContext.drainUsdc > 0) {
-        addBalanceChange('USDC', -analysisContext.drainUsdc, '恶意 DApp 交互扣减', `${analysisContext.approvalText} 后触发扣减`, nextBalance.USDC)
+      if (pendingExecution.drainUsdc > 0) {
+        addBalanceChange('USDC', -pendingExecution.drainUsdc, '恶意 DApp 交互扣减', `${pendingExecution.approvalText} 后触发扣减`, nextBalance.USDC)
       }
       addRecord(
-        `恶意合约交互已执行：${analysisContext.name}，恶意操作=${analysisContext.approvalText}，扣减 ${analysisContext.drainEth.toFixed(4)} ETH / ${analysisContext.drainUsdc.toFixed(2)} USDC`
+        `恶意合约交互已执行：${pendingExecution.name}，恶意操作=${pendingExecution.approvalText}，扣减 ${pendingExecution.drainEth.toFixed(4)} ETH / ${pendingExecution.drainUsdc.toFixed(2)} USDC`
       )
       setAudits((prev) => [
         ...prev,
         {
           time: nowText(),
           kind: '恶意 DApp 交互',
-          target: analysisContext.name,
-          riskType: analysisContext.riskType,
-          approvalText: analysisContext.approvalText,
-          drainEth: analysisContext.drainEth,
-          drainUsdc: analysisContext.drainUsdc,
+          target: pendingExecution.name,
+          riskType: pendingExecution.riskType,
+          approvalText: pendingExecution.approvalText,
+          drainEth: pendingExecution.drainEth,
+          drainUsdc: pendingExecution.drainUsdc,
           signatureDigest: summarizeSignature(signature),
+          addressSource,
           status: '已执行'
         }
       ])
     }
 
-    closeAnalysis()
+    setPendingExecution(null)
+    closeSignNotice()
+  }
+
+  function cancelPendingExecution() {
+    if (pendingExecution) {
+      if (pendingExecution.mode === 'transfer') {
+        setAudits((prev) => [
+          ...prev,
+          {
+            time: nowText(),
+            kind: '恶意地址转账',
+            target: pendingExecution.label,
+            riskType: pendingExecution.riskType,
+            approvalText: '已取消',
+            drainEth: 0,
+            drainUsdc: 0,
+            signatureDigest: summarizeSignature(signature),
+            addressSource,
+            status: '已取消'
+          }
+        ])
+      } else {
+        setAudits((prev) => [
+          ...prev,
+          {
+            time: nowText(),
+            kind: '恶意 DApp 交互',
+            target: pendingExecution.name,
+            riskType: pendingExecution.riskType,
+            approvalText: '已取消',
+            drainEth: 0,
+            drainUsdc: 0,
+            signatureDigest: summarizeSignature(signature),
+            addressSource,
+            status: '已取消'
+          }
+        ])
+      }
+      addRecord('用户在风险提示阶段取消了本次操作')
+    }
+    setPendingExecution(null)
+    closeSignNotice()
   }
 
   function cancelAction() {
@@ -347,6 +456,7 @@ export default function App() {
             drainEth: 0,
             drainUsdc: 0,
             signatureDigest: summarizeSignature(signature),
+            addressSource,
             status: '已取消'
           }
         ])
@@ -362,6 +472,7 @@ export default function App() {
             drainEth: 0,
             drainUsdc: 0,
             signatureDigest: summarizeSignature(signature),
+            addressSource,
             status: '已取消'
           }
         ])
@@ -372,23 +483,21 @@ export default function App() {
   }
 
   async function createWallet() {
+    setCreatingWallet(true)
     try {
       const info = await walletCoreService.createWallet(walletPassword)
       setWalletId(info.walletId)
       setMnemonicMasked(info.mnemonicMasked)
+      setEthAddress(info.ethAddress)
+      setAddressSource(info.addressSource)
+      setShowFullAddress(false)
       setCoreStatus('钱包创建成功')
+      addRecord(`钱包创建成功，本次地址来源：${getAddressSourceLabel(info.addressSource)}`)
     } catch (error) {
       setCoreStatus(`创建失败：${getErrorMessage(error)}`)
-    }
-  }
-
-  async function deriveAddress() {
-    try {
-      const address = await walletCoreService.deriveAddress(walletId, 'ETH')
-      setDerivedAddress(address)
-      setCoreStatus('地址派生成功')
-    } catch (error) {
-      setCoreStatus(`派生失败：${getErrorMessage(error)}`)
+      addRecord(`钱包创建失败：${getErrorMessage(error)}`)
+    } finally {
+      setCreatingWallet(false)
     }
   }
 
@@ -417,10 +526,10 @@ export default function App() {
     setBalances({ ETH: nextEth, USDC: nextUsdc })
 
     if (diffEth !== 0) {
-      addBalanceChange('ETH', diffEth, '测试修改余额', '测试菜单手动修改', nextEth)
+      addBalanceChange('ETH', diffEth, '测试修改余额', '测试菜单手动修改', nextEth, 'unavailable')
     }
     if (diffUsdc !== 0) {
-      addBalanceChange('USDC', diffUsdc, '测试修改余额', '测试菜单手动修改', nextUsdc)
+      addBalanceChange('USDC', diffUsdc, '测试修改余额', '测试菜单手动修改', nextUsdc, 'unavailable')
     }
     addRecord(`测试菜单修改余额：ETH=${nextEth.toFixed(4)}，USDC=${nextUsdc.toFixed(2)}`)
   }
@@ -430,7 +539,13 @@ export default function App() {
     setIsTotalHidden(false)
     setBalanceChanges([])
     setAudits([])
-    setRecords(['系统初始化：钱包已创建，等待领取测试资产。', `${nowText()} | 钱包状态已重置`])
+    setWalletId('')
+    setMnemonicMasked('')
+    setEthAddress('')
+    setAddressSource('unavailable')
+    setSignature('')
+    setShowFullAddress(false)
+    setRecords(['系统初始化：检测到未创建钱包，已进入创建钱包引导。', `${nowText()} | 钱包状态已重置`])
     setSetEthInput('0.0000')
     setSetUsdcInput('0.00')
   }
@@ -446,15 +561,15 @@ export default function App() {
         <header className="topbar">
           <div>
             <p className="eyebrow">安全钱包演示</p>
-            <h1>imToken</h1>
+            <h1>明御安全钱包</h1>
           </div>
-          <Button onClick={claimAssets}>领取测试资产</Button>
+          <Button onClick={claimAssets} disabled={!walletId}>领取测试资产</Button>
         </header>
 
         <section className="tabs">
-          <button className={activeTab === 'wallet' ? 'tab active' : 'tab'} onClick={() => setActiveTab('wallet')}>钱包</button>
-          <button className={activeTab === 'contract' ? 'tab active' : 'tab'} onClick={() => setActiveTab('contract')}>合约</button>
-          <button className={activeTab === 'test' ? 'tab active' : 'tab'} onClick={() => setActiveTab('test')}>测试</button>
+          <button className={activeTab === 'wallet' ? 'tab active' : 'tab'} onClick={() => setActiveTab('wallet')} disabled={!walletId}>钱包</button>
+          <button className={activeTab === 'contract' ? 'tab active' : 'tab'} onClick={() => setActiveTab('contract')} disabled={!walletId}>合约</button>
+          <button className={activeTab === 'test' ? 'tab active' : 'tab'} onClick={() => setActiveTab('test')} disabled={!walletId}>测试</button>
         </section>
 
         {activeTab === 'wallet' ? (
@@ -464,6 +579,16 @@ export default function App() {
                 <span className="total-label">钱包总额（点击隐藏）</span>
                 <strong className="total-value">{isTotalHidden ? '******' : `$${totalBalance.toFixed(2)}`}</strong>
               </button>
+              <div className="address-summary">
+                <p className="tiny balance-tiny">ETH 地址（Token Core）</p>
+                {ethAddress ? (
+                  <button className="address-btn" onClick={() => setShowFullAddress((prev) => !prev)}>
+                    {showFullAddress ? ethAddress : shorten(ethAddress)}
+                  </button>
+                ) : (
+                  <p className="tiny balance-tiny">未获得可展示地址</p>
+                )}
+              </div>
             </Card>
 
             <Card title="资产" className="asset-card">
@@ -479,35 +604,7 @@ export default function App() {
               </div>
             </Card>
 
-            <Card title="Token Core 内核能力" className="core-card">
-              <p className="runtime">内核运行模式：{coreMode}</p>
-              <div className="grid-two">
-                <div>
-                  <label>钱包密码</label>
-                  <Input value={walletPassword} onChange={(e) => setWalletPassword(e.target.value)} />
-                </div>
-                <div className="actions-inline">
-                  <Button onClick={() => void createWallet()} disabled={!coreReady}>创建钱包</Button>
-                  <Button variant="secondary" onClick={() => void deriveAddress()} disabled={!walletId}>派生地址</Button>
-                </div>
-              </div>
-              <p className="tiny">walletId：{walletId || '-'}</p>
-              <p className="tiny">助记词（遮罩）：{mnemonicMasked || '-'}</p>
-              <p className="tiny">ETH 地址：{derivedAddress || '-'}</p>
-              <div className="grid-two">
-                <div>
-                  <label>待签名内容</label>
-                  <Input value={signInput} onChange={(e) => setSignInput(e.target.value)} />
-                </div>
-                <div className="actions-inline">
-                  <Button variant="warning" onClick={() => void signMessage()} disabled={!walletId}>消息签名</Button>
-                </div>
-              </div>
-              <p className="tiny">签名结果：{signature || '-'}</p>
-              <p className="tiny">状态：{coreStatus}</p>
-            </Card>
-
-            <Card title="转账模拟（先选地址，再 AI 分析）" className="transfer-card" >
+            <Card title="转账模拟" className="transfer-card" >
               <div id="transfer-card" />
               <label>目标地址（内置风险样本）</label>
               <Select value={String(selectedAddressIndex)} onChange={(e) => setSelectedAddressIndex(Number(e.target.value))}>
@@ -529,7 +626,6 @@ export default function App() {
                   <Input value={amountInput} onChange={(e) => setAmountInput(e.target.value)} type="number" step="0.0001" min="0" />
                 </div>
               </div>
-
               <Button block onClick={() => void startTransferFlow()}>开始风险分析并转账</Button>
             </Card>
           </>
@@ -566,6 +662,37 @@ export default function App() {
 
         {activeTab === 'test' ? (
           <>
+            <Card title="Token Core 内核能力" className="core-card">
+              <p className="runtime">内核运行模式：{coreMode}</p>
+              <div className="grid-two">
+                <div>
+                  <label>钱包密码</label>
+                  <Input value={walletPassword} onChange={(e) => setWalletPassword(e.target.value)} />
+                </div>
+                <div className="actions-inline">
+                  <Button onClick={() => void createWallet()} disabled={!coreReady || creatingWallet}>{creatingWallet ? '创建中...' : '创建钱包'}</Button>
+                </div>
+              </div>
+              <p className="tiny">walletId：{walletId || '-'}</p>
+              <p className="tiny">助记词（遮罩）：{mnemonicMasked || '-'}</p>
+              <p className="tiny">ETH 地址来源：{getAddressSourceLabel(addressSource)}</p>
+              <p className="tiny">
+                ETH 地址：
+                {ethAddress ? (showFullAddress ? ethAddress : shorten(ethAddress)) : '-'}
+              </p>
+              <div className="grid-two">
+                <div>
+                  <label>待签名内容</label>
+                  <Input value={signInput} onChange={(e) => setSignInput(e.target.value)} />
+                </div>
+                <div className="actions-inline">
+                  <Button variant="warning" onClick={() => void signMessage()} disabled={!walletId}>消息签名</Button>
+                </div>
+              </div>
+              <p className="tiny">签名结果：{signature || '-'}</p>
+              <p className="tiny">状态：{coreStatus}</p>
+            </Card>
+
             <Card title="测试工具（修改余额）">
               <div className="grid-two">
                 <div>
@@ -584,7 +711,7 @@ export default function App() {
               <ul className="list-grid">
                 {audits.length === 0 ? <li className="list-item">暂无恶意交互日志</li> : audits.slice().reverse().map((item, idx) => (
                   <li className="list-item" key={`${item.time}-${idx}`}>
-                    {item.time} | {item.kind} | {item.target} | 授权={item.approvalText} | 扣减={item.drainEth.toFixed(4)} ETH/{item.drainUsdc.toFixed(2)} USDC | 签名={item.signatureDigest} | 状态={item.status}
+                    {item.time} | {item.kind} | {item.target} | 地址来源={getAddressSourceLabel(item.addressSource)} | 授权={item.approvalText} | 扣减={item.drainEth.toFixed(4)} ETH/{item.drainUsdc.toFixed(2)} USDC | 签名={item.signatureDigest} | 状态={item.status}
                   </li>
                 ))}
               </ul>
@@ -604,6 +731,44 @@ export default function App() {
           </>
         ) : null}
       </main>
+
+      {!walletId ? (
+        <div className="wallet-mask">
+          <div className="wallet-mask-panel">
+            <h2>创建钱包后继续</h2>
+            <p>当前未检测到钱包，请先创建钱包以解锁资产、转账和合约交互功能。</p>
+            <label>钱包密码</label>
+            <Input value={walletPassword} onChange={(e) => setWalletPassword(e.target.value)} />
+            <Button block onClick={() => void createWallet()} disabled={!coreReady || creatingWallet}>
+              {creatingWallet ? '创建中...' : '立即创建钱包'}
+            </Button>
+            <p className="tiny">内核状态：{coreStatus}</p>
+            <p className="tiny">运行模式：{coreMode}</p>
+          </div>
+        </div>
+      ) : null}
+
+      {signNotice ? (
+        <div className="modal-overlay">
+          <div className="modal-panel">
+            <header className="modal-header">
+              <h2>{signNotice.title}</h2>
+            </header>
+            <section className="source-board">
+              <p>{signNotice.summary}</p>
+              <p className="tiny">签名摘要：{signNotice.signatureDigest}</p>
+              <p className="tiny">风险分：{signNotice.riskScore}/100</p>
+              <p className="tiny">预计损失：{signNotice.lossText}</p>
+            </section>
+            <section className="result-panel">
+              <p>AI 补救建议：{signNotice.advice}</p>
+            </section>
+            <footer className="modal-actions">
+              <Button variant="danger" onClick={executePendingAction}>我已经知晓</Button>
+            </footer>
+          </div>
+        </div>
+      ) : null}
 
       {analysis.open ? (
         <div className="modal-overlay">
@@ -639,14 +804,19 @@ export default function App() {
               ))}
             </section>
 
-            <section className="result-panel">
-              <p>风险分：{analysis.score}/100</p>
-              <p>风险等级：<span className={analysis.score >= 80 ? 'risk-high' : ''}>{analysis.level}</span></p>
-            </section>
+            {analysis.done ? (
+              <section className="result-panel">
+                <p>风险分：{analysis.score}/100</p>
+                <p>风险等级：<span className={analysis.score >= 80 ? 'risk-high' : ''}>{analysis.level}</span></p>
+                <p>AI 建议动作：{analysisContext ? analysisContext.aiAdvice : '-'}</p>
+              </section>
+            ) : null}
 
             <footer className="modal-actions">
               <Button variant="ghost" onClick={cancelAction}>取消操作</Button>
-              <Button variant="danger" onClick={confirmAction} disabled={!analysis.done}>确认继续</Button>
+              <Button variant="danger" onClick={() => void confirmAction()} disabled={!analysis.done || signingAction}>
+                {signingAction ? '签名中...' : analysisContext?.mode === 'contract' ? '签名合约操作' : '签名转账操作'}
+              </Button>
             </footer>
           </div>
         </div>
@@ -664,7 +834,7 @@ export default function App() {
                 <li className="list-item">暂无记录</li>
               ) : tokenChanges.map((item, idx) => (
                 <li className="list-item" key={`${item.time}-${idx}`}>
-                  {item.time} | {item.action} | {formatDelta(item.delta, item.token)} | 触发：{item.detail} | 变动后：{formatBalance(item.after, item.token)}
+                  {item.time} | {item.action} | {formatDelta(item.delta, item.token)} | 来源：{getAddressSourceLabel(item.addressSource)} | 触发：{item.detail} | 变动后：{formatBalance(item.after, item.token)}
                 </li>
               ))}
             </ul>
@@ -702,4 +872,17 @@ function shorten(addr: string) {
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) return error.message
   return String(error)
+}
+
+function getAddressSourceLabel(source: AddressSource) {
+  if (source === 'token_core_real') return 'Token Core 真实地址'
+  if (source === 'demo_fallback') return '兼容演示地址（非真实）'
+  return '未获得真实地址'
+}
+
+function formatLossForNotice(ctx: ActionContext) {
+  if (ctx.mode === 'transfer') {
+    return `${formatBalance(ctx.amount, ctx.token)} ${ctx.token}`
+  }
+  return `${ctx.drainEth.toFixed(4)} ETH / ${ctx.drainUsdc.toFixed(2)} USDC`
 }
